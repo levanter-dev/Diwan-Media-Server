@@ -1,0 +1,55 @@
+﻿# --- Secrets & environment ---
+.env
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec.bak
+
+# --- Node ---
+node_modules/
+
+# --- User data & runtime ---
+data/
+media/
+*.db
+*.sqlite3
+*.sqlite
+
+# --- Logs & temp ---
+*.log
+.tmp-*
+
+# --- Debug / scratch files ---
+debug_*.html
+debug_*.txt
+
+# --- Bundled binaries ---
+vendor/ffmpeg/bin/*.exe
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE ---
+.idea/
+.vscode/settings.json
+
+# --- Test ---
+.pytest_cache/
+
+# --- Scrapers (local-only, see LOCAL_SETUP.md) ---
+LOCAL_SETUP.md
+app/scrapers/aether.py
+app/scrapers/hdtoday.py
+app/scrapers/larroza.py
+app/scrapers/ramoflix.py
+app/scrapers/shahid.py
+app/scrapers/shuttletv.py
+app/scrapers/soap2day.py
+

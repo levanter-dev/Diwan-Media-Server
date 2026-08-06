@@ -1,0 +1,11 @@
+{
+  "name": "local-media-portal",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "multicast-dns": "^7.2.5"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

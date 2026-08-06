@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic-settings==2.7.1
+playwright==1.49.0
+nudenet==3.4.2
+open-clip-torch==3.3.0
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128; platform_system == 'Windows'
+torchvision==0.26.0+cu128; platform_system == 'Windows'
