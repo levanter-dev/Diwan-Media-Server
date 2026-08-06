@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any
 
 from .base import BaseAdapter
@@ -9,6 +11,8 @@ from .models import SourceMedia, ServerSource, SourceResult
 logger = logging.getLogger(__name__)
 
 _registry: list[BaseAdapter] = []
+
+ADAPTER_TIMEOUT = int(os.environ.get("SCRAPE_ADAPTER_TIMEOUT", "20"))
 
 # Scrapers are optional — they ship as local-only files not tracked in git.
 # See LOCAL_SETUP.md for how to restore them.
@@ -72,28 +76,64 @@ def get_adapters() -> list[BaseAdapter]:
     return list(_registry)
 
 
-def search_all(query: str, media_type: str | None = None) -> list[dict[str, Any]]:
+def _search_one(adapter: BaseAdapter, query: str, media_type: str | None) -> dict[str, Any]:
+    logger.info("--- Searching adapter '%s' (%s) for: %s ---", adapter.adapter_name, adapter.adapter_id, query)
+    try:
+        media_list = adapter.search(query, media_type)
+        logger.info("Adapter '%s' returned %d results", adapter.adapter_name, len(media_list))
+        return {
+            "adapter_id": adapter.adapter_id,
+            "adapter_name": adapter.adapter_name,
+            "media_list": [m.to_dict() for m in media_list] if media_list else [],
+        }
+    except Exception as exc:
+        logger.error("Adapter '%s' search FAILED: %s", adapter.adapter_name, exc)
+        return {
+            "adapter_id": adapter.adapter_id,
+            "adapter_name": adapter.adapter_name,
+            "media_list": [],
+            "error": str(exc),
+        }
+
+
+def search_all(query: str, media_type: str | None = None, parallel: bool = True) -> list[dict[str, Any]]:
     _ensure_registry()
+    if not parallel or len(_registry) <= 1:
+        results: list[dict[str, Any]] = []
+        for adapter in _registry:
+            results.append(_search_one(adapter, query, media_type))
+        return results
+
+    logger.info("=== Parallel search on %d adapters (timeout=%ss) ===", len(_registry), ADAPTER_TIMEOUT)
     results: list[dict[str, Any]] = []
-    for adapter in _registry:
-        logger.info("--- Searching adapter '%s' (%s) for: %s ---", adapter.adapter_name, adapter.adapter_id, query)
-        try:
-            media_list = adapter.search(query, media_type)
-            logger.info("Adapter '%s' returned %d results", adapter.adapter_name, len(media_list))
-            if media_list:
+    with ThreadPoolExecutor(max_workers=len(_registry), thread_name_prefix="scrape-search") as executor:
+        future_map = {
+            executor.submit(_search_one, adapter, query, media_type): adapter
+            for adapter in _registry
+        }
+        for future, adapter in future_map.items():
+            try:
+                result = future.result(timeout=ADAPTER_TIMEOUT)
+                results.append(result)
+            except FutureTimeoutError:
+                logger.error("Adapter '%s' TIMED OUT after %ss", adapter.adapter_name, ADAPTER_TIMEOUT)
                 results.append({
                     "adapter_id": adapter.adapter_id,
                     "adapter_name": adapter.adapter_name,
-                    "media_list": [m.to_dict() for m in media_list],
+                    "media_list": [],
+                    "error": f"timed out after {ADAPTER_TIMEOUT}s",
                 })
-        except Exception as exc:
-            logger.error("Adapter '%s' search FAILED: %s", adapter.adapter_name, exc)
-            results.append({
-                "adapter_id": adapter.adapter_id,
-                "adapter_name": adapter.adapter_name,
-                "media_list": [],
-                "error": str(exc),
-            })
+            except Exception as exc:
+                logger.error("Adapter '%s' future failed: %s", adapter.adapter_name, exc)
+                results.append({
+                    "adapter_id": adapter.adapter_id,
+                    "adapter_name": adapter.adapter_name,
+                    "media_list": [],
+                    "error": str(exc),
+                })
+
+    _order = {a.adapter_id: i for i, a in enumerate(_registry)}
+    results.sort(key=lambda r: _order.get(r.get("adapter_id", ""), 999))
     return results
 
 

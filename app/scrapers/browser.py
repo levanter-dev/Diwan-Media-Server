@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -16,6 +15,9 @@ from .models import ServerSource
 
 logger = logging.getLogger(__name__)
 
+_MAX_BROWSERS = int(os.environ.get("SCRAPE_MAX_BROWSERS", "7"))
+_browser_semaphore = threading.BoundedSemaphore(_MAX_BROWSERS)
+
 
 class BrowserError(RuntimeError):
     pass
@@ -23,36 +25,29 @@ class BrowserError(RuntimeError):
 
 class BrowserPool:
     _local = threading.local()
-    _lock = threading.Lock()
+    _access_lock = threading.Lock()
 
     def __init__(self) -> None:
         self._browser = None
         self._playwright = None
         self._initialized = False
-        self._executor: ThreadPoolExecutor | None = None
-
-    def _get_executor(self) -> ThreadPoolExecutor:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="browser")
-        return self._executor
-
-    def _run_on_browser_thread(self, fn, *args, **kwargs):
-        """Run *fn* on the dedicated browser thread so that Playwright
-        sync objects are never touched from an asyncio event-loop thread."""
-        return self._get_executor().submit(fn, *args, **kwargs).result()
+        self._semaphore_acquired = False
 
     @classmethod
     def get(cls) -> BrowserPool:
-        if not hasattr(cls._local, "instance") or cls._local.instance is None:
+        if not hasattr(cls._local, "instance"):
             cls._local.instance = cls()
         return cls._local.instance
 
     def _ensure_browser(self) -> None:
         if self._initialized:
             return
-        logger.info("Launching headless Chromium browser ...")
-
-        def _launch():
+        with BrowserPool._access_lock:
+            if self._initialized:
+                return
+            _browser_semaphore.acquire()
+            self._semaphore_acquired = True
+            logger.info("Launching headless Chromium browser ...")
             try:
                 pw = sync_playwright().start()
                 browser = pw.chromium.launch(
@@ -63,21 +58,28 @@ class BrowserPool:
                         "--disable-blink-features=AutomationControlled",
                     ],
                 )
-                return pw, browser
+                self._playwright = pw
+                self._browser = browser
+                self._initialized = True
+                logger.info("Chromium browser launched successfully")
             except ImportError:
+                if self._semaphore_acquired:
+                    _browser_semaphore.release()
+                    self._semaphore_acquired = False
                 raise BrowserError(
                     "Playwright is not installed. Run: pip install playwright && playwright install chromium"
                 )
-
-        try:
-            self._playwright, self._browser = self._run_on_browser_thread(_launch)
-            self._initialized = True
-            logger.info("Chromium browser launched successfully")
-        except BrowserError:
-            raise
-        except Exception as exc:
-            self._initialized = False
-            raise BrowserError(f"Failed to launch browser: {exc}")
+            except BrowserError:
+                if self._semaphore_acquired:
+                    _browser_semaphore.release()
+                    self._semaphore_acquired = False
+                raise
+            except Exception as exc:
+                if self._semaphore_acquired:
+                    _browser_semaphore.release()
+                    self._semaphore_acquired = False
+                self._initialized = False
+                raise BrowserError(f"Failed to launch browser: {exc}")
 
     def _new_page(self, timeout: int = 30000):
         self._ensure_browser()
@@ -94,51 +96,47 @@ class BrowserPool:
         return context, page
 
     def extract_video_urls(self, page_url: str, timeout: int = 30000) -> list[ServerSource]:
-        def _run():
-            logger.info("Extracting video URLs from: %s", page_url)
-            servers, html = self._extract_from_page(page_url, timeout)
-            if servers:
-                logger.info("Found %d server sources via browser extraction", len(servers))
-                return servers
-            found_in_html = _extract_mp4_from_text(html)
-            if found_in_html:
-                logger.info("Found %d MP4 URLs via HTML regex scan", len(found_in_html))
-            return _build_servers(found_in_html, page_url)
-        return self._run_on_browser_thread(_run)
+        logger.info("Extracting video URLs from: %s", page_url)
+        servers, html = self._extract_from_page(page_url, timeout)
+        if servers:
+            logger.info("Found %d server sources via browser extraction", len(servers))
+            return servers
+        found_in_html = _extract_mp4_from_text(html)
+        if found_in_html:
+            logger.info("Found %d MP4 URLs via HTML regex scan", len(found_in_html))
+        return _build_servers(found_in_html, page_url)
 
     def extract_from_iframe_urls(
         self, iframe_urls: list[str], timeout: int = 20000
     ) -> list[ServerSource]:
-        def _run():
-            results: list[ServerSource] = []
-            for i, iframe_url in enumerate(iframe_urls):
-                logger.info("Inspecting iframe %d/%d: %s", i + 1, len(iframe_urls), iframe_url[:120])
-                try:
-                    page_result, _html = self._extract_from_page(iframe_url, timeout)
-                    if page_result:
-                        for s in page_result:
-                            s.server_name = _domain_label(iframe_url) + " - " + s.server_name
-                        results.extend(page_result)
-                        continue
-                    mp4_in_html = _extract_mp4_from_text(_html)
-                    if mp4_in_html:
-                        results.extend(
-                            [
-                                ServerSource(
-                                    server_id=f"mp4_{len(results)}",
-                                    server_name=f"{_domain_label(iframe_url)} - Source {i + 1}",
-                                    video_url=url,
-                                    quality=_guess_quality(url),
-                                    direct=True,
-                                )
-                                for i, url in enumerate(mp4_in_html)
-                            ]
-                        )
-                except BrowserError as exc:
-                    logger.warning("Iframe %d/%d failed: %s", i + 1, len(iframe_urls), exc)
+        results: list[ServerSource] = []
+        for i, iframe_url in enumerate(iframe_urls):
+            logger.info("Inspecting iframe %d/%d: %s", i + 1, len(iframe_urls), iframe_url[:120])
+            try:
+                page_result, _html = self._extract_from_page(iframe_url, timeout)
+                if page_result:
+                    for s in page_result:
+                        s.server_name = _domain_label(iframe_url) + " - " + s.server_name
+                    results.extend(page_result)
                     continue
-            return results
-        return self._run_on_browser_thread(_run)
+                mp4_in_html = _extract_mp4_from_text(_html)
+                if mp4_in_html:
+                    results.extend(
+                        [
+                            ServerSource(
+                                server_id=f"mp4_{len(results)}",
+                                server_name=f"{_domain_label(iframe_url)} - Source {i + 1}",
+                                video_url=url,
+                                quality=_guess_quality(url),
+                                direct=True,
+                            )
+                            for j, url in enumerate(mp4_in_html)
+                        ]
+                    )
+            except BrowserError as exc:
+                logger.warning("Iframe %d/%d failed: %s", i + 1, len(iframe_urls), exc)
+                continue
+        return results
 
     def _extract_from_page(
         self, page_url: str, timeout: int = 30000
@@ -221,36 +219,34 @@ class BrowserPool:
 
     def fetch_rendered_html(self, url: str, timeout: int = 30000) -> str:
         """Fetch fully JS-rendered HTML using headless Chromium."""
-        def _run():
-            self._ensure_browser()
-            context, page = self._new_page(timeout)
-            logger.info("Chromium fetching rendered HTML from: %s", url)
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=min(timeout, 20000))
-                for _ in range(10):
-                    time.sleep(2)
-                    title = page.title()
-                    if "just a moment" not in title.lower() and "cloudflare" not in title.lower():
-                        break
-                    html = page.content()
-                    if len(html) > 5000 and "cloudflare" not in html.lower():
-                        break
+        self._ensure_browser()
+        context, page = self._new_page(timeout)
+        logger.info("Chromium fetching rendered HTML from: %s", url)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=min(timeout, 20000))
+            for _ in range(10):
+                time.sleep(2)
+                title = page.title()
+                if "just a moment" not in title.lower() and "cloudflare" not in title.lower():
+                    break
                 html = page.content()
-                logger.info("Chromium rendered page: %d chars of HTML", len(html))
-                return html
-            except Exception as exc:
-                logger.error("Chromium fetch failed for %s: %s", url, exc)
-                raise BrowserError(f"Chromium failed to load {url}: {exc}")
-            finally:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-                try:
-                    context.close()
-                except Exception:
-                    pass
-        return self._run_on_browser_thread(_run)
+                if len(html) > 5000 and "cloudflare" not in html.lower():
+                    break
+            html = page.content()
+            logger.info("Chromium rendered page: %d chars of HTML", len(html))
+            return html
+        except Exception as exc:
+            logger.error("Chromium fetch failed for %s: %s", url, exc)
+            raise BrowserError(f"Chromium failed to load {url}: {exc}")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
 
     def extract_download_button_url(
         self,
@@ -259,132 +255,122 @@ class BrowserPool:
         wait_seconds: int = 15,
         timeout: int = 30000,
     ) -> str | None:
-        def _run():
-            self._ensure_browser()
-            context, page = self._new_page(timeout)
-            logger.info("Download extraction: navigating to %s", page_url)
+        self._ensure_browser()
+        context, page = self._new_page(timeout)
+        logger.info("Download extraction: navigating to %s", page_url)
 
-            captured_urls: list[str] = []
+        captured_urls: list[str] = []
 
-            def _on_response(response):
-                url = response.url
-                content_type = response.headers.get("content-type", "")
-                if url.endswith(".mp4") or "video/mp4" in content_type or url.endswith(".m3u8") or "mpegurl" in content_type:
-                    logger.info("Download page: detected stream %s", url[:120])
-                    captured_urls.append(url)
+        def _on_response(response):
+            url = response.url
+            content_type = response.headers.get("content-type", "")
+            if url.endswith(".mp4") or "video/mp4" in content_type or url.endswith(".m3u8") or "mpegurl" in content_type:
+                logger.info("Download page: detected stream %s", url[:120])
+                captured_urls.append(url)
 
-            context.on("response", _on_response)
+        context.on("response", _on_response)
 
-            button_selectors = [button_selector]
-            if button_selector == '[data-link-id="0"]':
-                button_selectors = [
-                    '[data-link-id="0"]',
-                    '[data-link-id="1"]',
-                    '.download-btn',
-                    'a.download-link',
-                    'button:has-text("Download")',
-                    'a:has-text("Download")',
-                ]
+        button_selectors = [button_selector]
+        if button_selector == '[data-link-id="0"]':
+            button_selectors = [
+                '[data-link-id="0"]',
+                '[data-link-id="1"]',
+                '.download-btn',
+                'a.download-link',
+                'button:has-text("Download")',
+                'a:has-text("Download")',
+            ]
 
+        try:
+            page.goto(page_url, wait_until="domcontentloaded", timeout=timeout)
+            time.sleep(3)
+
+            if captured_urls:
+                logger.info("Download page: network captured %d URLs before button click", len(captured_urls))
+                return captured_urls[0]
+
+            button = None
+            for sel in button_selectors:
+                button = page.query_selector(sel)
+                if button:
+                    logger.info("Found download button: %s", sel)
+                    break
+
+            if not button:
+                logger.warning("No download button found on page, checking page HTML for links")
+                html = page.content()
+                mp4_urls = _extract_mp4_from_text(html)
+                for u in mp4_urls:
+                    full = urljoin(page_url, u)
+                    if full not in captured_urls:
+                        captured_urls.append(full)
+                if captured_urls:
+                    logger.info("Found %d MP4 URLs in download page HTML", len(captured_urls))
+                    return captured_urls[0]
+                return None
+
+            logger.info("Clicking download button: %s", button_selector)
+            button.click(timeout=5000)
+            logger.info("Waiting %ds for download link to generate ...", wait_seconds)
+
+            elapsed = 0
+            poll_interval = 0.5
+            href = None
+            while elapsed < wait_seconds:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    current_button = page.query_selector(button_selector)
+                    if current_button:
+                        href = current_button.get_attribute("href")
+                        if href and href.strip():
+                            break
+                except Exception:
+                    continue
+                if captured_urls:
+                    break
+
+            if captured_urls:
+                logger.info("Download page: network captured URL: %s", captured_urls[0][:150])
+                return captured_urls[0]
+
+            if href and href.strip():
+                logger.info("Download link extracted: %s", href[:150])
+                return href.strip()
+
+            logger.warning("No download link obtained after %ds wait", wait_seconds)
+            return None
+        except Exception as exc:
+            logger.error("Download button extraction failed: %s", exc)
+            return None
+        finally:
             try:
-                page.goto(page_url, wait_until="domcontentloaded", timeout=timeout)
-                time.sleep(3)
-
-                if captured_urls:
-                    logger.info("Download page: network captured %d URLs before button click", len(captured_urls))
-                    return captured_urls[0]
-
-                button = None
-                for sel in button_selectors:
-                    button = page.query_selector(sel)
-                    if button:
-                        logger.info("Found download button: %s", sel)
-                        break
-
-                if not button:
-                    logger.warning("No download button found on page, checking page HTML for links")
-                    html = page.content()
-                    mp4_urls = _extract_mp4_from_text(html)
-                    for u in mp4_urls:
-                        full = urljoin(page_url, u)
-                        if full not in captured_urls:
-                            captured_urls.append(full)
-                    if captured_urls:
-                        logger.info("Found %d MP4 URLs in download page HTML", len(captured_urls))
-                        return captured_urls[0]
-                    return None
-
-                logger.info("Clicking download button: %s", button_selector)
-                button.click(timeout=5000)
-                logger.info("Waiting %ds for download link to generate ...", wait_seconds)
-
-                elapsed = 0
-                poll_interval = 0.5
-                href = None
-                while elapsed < wait_seconds:
-                    time.sleep(poll_interval)
-                    elapsed += poll_interval
-                    try:
-                        current_button = page.query_selector(button_selector)
-                        if current_button:
-                            href = current_button.get_attribute("href")
-                            if href and href.strip():
-                                break
-                    except Exception:
-                        continue
-                    if captured_urls:
-                        break
-
-                if captured_urls:
-                    logger.info("Download page: network captured URL: %s", captured_urls[0][:150])
-                    return captured_urls[0]
-
-                if href and href.strip():
-                    logger.info("Download link extracted: %s", href[:150])
-                    return href.strip()
-
-                logger.warning("No download link obtained after %ds wait", wait_seconds)
-                return None
-            except Exception as exc:
-                logger.error("Download button extraction failed: %s", exc)
-                return None
-            finally:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-                try:
-                    context.close()
-                except Exception:
-                    pass
-        return self._run_on_browser_thread(_run)
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
 
     def close(self) -> None:
         logger.info("Shutting down browser pool")
-
-        def _cleanup():
-            if self._browser:
-                try:
-                    self._browser.close()
-                except Exception:
-                    pass
-            if self._playwright:
-                try:
-                    self._playwright.stop()
-                except Exception:
-                    pass
-            self._browser = None
-            self._playwright = None
-            self._initialized = False
-
-        if self._initialized:
+        if self._browser:
             try:
-                self._run_on_browser_thread(_cleanup)
+                self._browser.close()
             except Exception:
                 pass
-        if self._executor:
-            self._executor.shutdown(wait=False)
-            self._executor = None
+        if self._playwright:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+        self._browser = None
+        self._playwright = None
+        self._initialized = False
+        if self._semaphore_acquired:
+            _browser_semaphore.release()
+            self._semaphore_acquired = False
 
 
 def _try_click_play(page) -> None:

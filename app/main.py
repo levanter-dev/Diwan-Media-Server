@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -26,6 +27,7 @@ from .scrapers.opensubtitles import search_subtitles as opensub_search, get_subt
 
 app = FastAPI(title="Diwan", version="0.3.0")
 WEB = (Path(__file__).parent.parent / "web").resolve()
+logger = logging.getLogger(__name__)
 
 # Experimental features toggle — scrapers and download-from-source are off by default.
 # Set EXPERIMENTAL=1 in .env to enable them.
@@ -691,8 +693,9 @@ def _unlink_media_file(file_path: Path) -> bool:
         return False
     if not file_path.is_file():
         raise OSError(f"Media path is not a file: {file_path}")
+    import gc
     last_error: OSError | None = None
-    for attempt in range(6):
+    for attempt in range(12):
         try:
             file_path.unlink()
             if file_path.exists():
@@ -700,8 +703,9 @@ def _unlink_media_file(file_path: Path) -> bool:
             return True
         except OSError as exc:
             last_error = exc
-            if attempt < 5:
-                time.sleep(0.15 * (attempt + 1))
+            if attempt < 11:
+                gc.collect()
+                time.sleep(0.3 * (attempt + 1))
     assert last_error is not None
     raise last_error
 
@@ -859,45 +863,48 @@ async def scrape_servers_batch(body: ScrapeBatchIn):
     if not _EXPERIMENTAL:
         raise HTTPException(404, "Experimental features are not enabled")
     from fastapi.responses import StreamingResponse
-    import asyncio, json
+    import asyncio, json, time as time_module
+
+    BATCH_ITEM_TIMEOUT = int(os.environ.get("SCRAPE_BATCH_ITEM_TIMEOUT", "45"))
+
+    def _extract_one(item):
+        with CaptureContext() as cap:
+            try:
+                result = extract_servers(item.adapter_id, item.source_id, item.title, item.media_type)
+                if "error" in result:
+                    return {"adapter_id": item.adapter_id, "source_id": item.source_id,
+                            "title": item.title, "error": result["error"], "servers": [], "logs": cap.logs}
+                return {"adapter_id": item.adapter_id, "source_id": item.source_id,
+                        "title": item.title, "servers": result.get("servers", []),
+                        "logs": cap.logs}
+            except Exception as exc:
+                return {"adapter_id": item.adapter_id, "source_id": item.source_id,
+                        "title": item.title, "error": str(exc), "servers": [], "logs": cap.logs}
+
+    async def _extract_with_timeout(item):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_extract_one, item),
+                timeout=BATCH_ITEM_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError, TimeoutError):
+            return {"adapter_id": item.adapter_id, "source_id": item.source_id,
+                    "title": item.title, "error": f"timed out after {BATCH_ITEM_TIMEOUT}s", "servers": [], "logs": []}
 
     async def generate():
         total = len(body.items)
-        all_results = []
-        for idx, item in enumerate(body.items):
-            progress = {
-                "type": "progress",
-                "index": idx,
-                "total": total,
-                "adapter_id": item.adapter_id,
-                "title": item.title,
-                "status": "extracting",
-            }
-            yield f"data: {json.dumps(progress)}\n\n"
+        yield f"data: {json.dumps({'type': 'start', 'total': total, 'parallel': True})}\n\n"
 
-            def run_extract():
-                with CaptureContext() as cap:
-                    try:
-                        result = extract_servers(item.adapter_id, item.source_id, item.title, item.media_type)
-                        if "error" in result:
-                            return {"adapter_id": item.adapter_id, "source_id": item.source_id,
-                                    "title": item.title, "error": result["error"], "servers": [], "logs": cap.logs}
-                        return {"adapter_id": item.adapter_id, "source_id": item.source_id,
-                                "title": item.title, "servers": result.get("servers", []),
-                                "logs": cap.logs}
-                    except Exception as exc:
-                        return {"adapter_id": item.adapter_id, "source_id": item.source_id,
-                                "title": item.title, "error": str(exc), "servers": [], "logs": cap.logs}
+        tasks = [_extract_with_timeout(item) for item in body.items]
+        t0 = time_module.time()
+        all_entries = await asyncio.gather(*tasks)
+        elapsed = time_module.time() - t0
+        logger.info("Batch extraction completed in %.1fs (%d items parallel)", elapsed, total)
 
-            try:
-                entry = await asyncio.wait_for(asyncio.to_thread(run_extract), timeout=60)
-            except (asyncio.TimeoutError, asyncio.CancelledError, TimeoutError):
-                entry = {"adapter_id": item.adapter_id, "source_id": item.source_id,
-                        "title": item.title, "error": "timed out after 60s", "servers": [], "logs": []}
-            all_results.append(entry)
+        for idx, entry in enumerate(all_entries):
             yield f"data: {json.dumps({'type': 'result', 'index': idx, 'total': total, **entry}, default=str)}\n\n"
 
-        yield f"data: {json.dumps({'type': 'done', 'results': all_results}, default=str)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'results': all_entries, 'elapsed': round(elapsed, 1)}, default=str)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
