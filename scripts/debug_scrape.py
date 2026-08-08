@@ -1,4 +1,4 @@
-"""Live debug script — searches for a movie across ALL sources in parallel, then tries to extract video streams.
+"""Live debug script  -  searches for a movie across ALL sources in parallel, then tries to extract video streams.
 
 Usage from project root:
     py scripts/debug_scrape.py "The Invention of Lying"
@@ -134,7 +134,7 @@ def extract_from_results(results: list[dict], dump_html: bool = False):
             })
 
     if not items:
-        print(f"  {COLORS['RED']}No items to extract — search returned nothing{_reset()}")
+        print(f"  {COLORS['RED']}No items to extract  -  search returned nothing{_reset()}")
         return
 
     print(f"Extracting {len(items)} items across {len(set(i['adapter_id'] for i in items))} adapters...\n")

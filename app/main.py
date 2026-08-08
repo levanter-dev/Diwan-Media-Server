@@ -5,16 +5,19 @@ import os
 import time
 import uuid
 import re as _re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from .content_analysis import (
-    AnalysisError, analysis_payload, cancel_analysis, category_definitions, clear_analysis,
-    enqueue_analysis, ensure_worker as ensure_analysis_worker, get_filter_settings, list_analysis_jobs, runtime_status, save_filter_settings, save_media_filter_overrides, save_content_segment_override,
+    AnalysisError, MODEL_VERSION, analysis_payload, cancel_analysis, category_definitions, clear_analysis,
+    enqueue_analysis, ensure_worker as ensure_analysis_worker, get_filter_settings, list_analysis_jobs, runtime_status,
+    save_content_range_review, save_filter_settings, save_media_filter_model, save_media_filter_overrides,
+    save_content_segment_override,
 )
-from .config import MEDIA_ROOTS
+from .config import FFMPEG_PATH, FFPROBE_PATH, MEDIA_ROOTS
 from .db import connect
 from .downloads import DOWNLOAD_DIR, DownloadError, action as download_action, delete_download, discover_sources, enqueue_download, ensure_worker as ensure_download_worker, get_download, get_download_settings, list_downloads, refetch_download, set_download_settings
 from .explore import ExploreError, discover, explore_home, explore_search, fetch_details, provider_status, selected_search_provider, set_secret, set_setting, suggestions_from_seeds
@@ -29,7 +32,7 @@ app = FastAPI(title="Diwan", version="0.3.0")
 WEB = (Path(__file__).parent.parent / "web").resolve()
 logger = logging.getLogger(__name__)
 
-# Experimental features toggle — scrapers and download-from-source are off by default.
+# Experimental features toggle  -  scrapers and download-from-source are off by default.
 # Set EXPERIMENTAL=1 in .env to enable them.
 _EXPERIMENTAL = os.getenv("EXPERIMENTAL", "0") == "1"
 
@@ -140,6 +143,20 @@ class SuggestionSeedIn(BaseModel):
 class CircleMemberIn(BaseModel):
     name: str
 
+class CircleProfilesTransferIn(BaseModel):
+    profile_ids: list[int] = Field(default_factory=list)
+    include_scores: bool = True
+    include_watched: bool = True
+    include_progress: bool = True
+
+class CircleProfilesImportIn(BaseModel):
+    format: str
+    profiles: list[dict] = Field(default_factory=list)
+    profile_ids: list[int] = Field(default_factory=list)
+    include_scores: bool = True
+    include_watched: bool = True
+    include_progress: bool = True
+
 class ScoringSettingsIn(BaseModel):
     mode: str = "average"
     circle_id: int | None = None
@@ -147,17 +164,37 @@ class ScoringSettingsIn(BaseModel):
 class ContentAnalysisIn(BaseModel):
     categories: list[str] | None = None
     sample_interval: float = 1.0
+    model_key: str | None = None
+    model_keys: list[str] | None = None
 
 class ContentFilterSettingsIn(BaseModel):
     policy: dict[str, str]
     sensitivity: str = "balanced"
     auto_analyze: bool = False
+    model_key: str = "nudenet_openclip"
+    confirmation: dict = Field(default_factory=dict)
+    controls_timeout_seconds: int = 3
+
+class ContentFilterImportIn(BaseModel):
+    format: str
+    settings: dict
+    media: list[dict] = Field(default_factory=list)
 
 class MediaFilterOverridesIn(BaseModel):
     enabled: dict[str, bool]
 
+class MediaFilterModelIn(BaseModel):
+    model_key: str | None = None
+
 class ContentSegmentOverrideIn(BaseModel):
     enabled: bool
+
+class ContentRangeReviewIn(BaseModel):
+    category: str
+    start_ms: int
+    end_ms: int
+    enabled: bool
+    note: str | None = None
 class MediaDirectUrlIn(BaseModel):
     url: str
     label: str | None = None
@@ -170,6 +207,7 @@ class MediaVersionMetaIn(BaseModel):
 class WatchedIn(BaseModel):
     watched: bool = True
     delete_file: bool = True
+    circle_id: int = 1
 def allowed_directory(raw_path: str) -> Path:
     if not raw_path:
         raise HTTPException(400, "Select a folder")
@@ -180,12 +218,80 @@ def allowed_directory(raw_path: str) -> Path:
         root = configured.resolve()
         if candidate == root or root in candidate.parents:
             return candidate
+    raise HTTPException(400, "Select a folder inside a configured media root")
+
+def _circle_exists(conn, circle_id: int) -> bool:
+    return bool(conn.execute("SELECT 1 FROM circle_members WHERE id=?", (int(circle_id),)).fetchone())
+
+def _media_catalog_entry(row: dict) -> dict:
+    meta = {}
+    try:
+        meta = json.loads(row.get("metadata") or "{}")
+    except Exception:
+        meta = {}
+    return {
+        "media_id": row.get("id"),
+        "title": meta.get("title") or row.get("title"),
+        "media_type": meta.get("media_type") or row.get("media_type"),
+        "provider": str(meta.get("provider") or "").lower(),
+        "external_id": str(meta.get("external_id") if meta.get("external_id") is not None else meta.get("id") or ""),
+        "year": meta.get("year") or "",
+        "path": row.get("path") or row.get("file_path") or "",
+        "metadata": meta,
+    }
+
+def _find_media_for_profile_entry(conn, entry: dict) -> int | None:
+    provider = str(entry.get("provider") or "").lower()
+    external_id = str(entry.get("external_id") or "")
+    if provider and external_id:
+        rows = conn.execute("SELECT id,title,media_type,path,metadata FROM media_items").fetchall()
+        for row in rows:
+            info = _media_catalog_entry(dict(row))
+            if info["provider"] == provider and info["external_id"] == external_id:
+                return int(row["id"])
+    path = str(entry.get("path") or "")
+    if path:
+        row = conn.execute("SELECT id FROM media_items WHERE path=?", (path,)).fetchone()
+        if row:
+            return int(row["id"])
+    title = str(entry.get("title") or "").strip().lower()
+    media_type = str(entry.get("media_type") or "").strip()
+    if title:
+        row = conn.execute("SELECT id FROM media_items WHERE lower(title)=? AND (?='' OR media_type=?) ORDER BY id LIMIT 1",
+                           (title, media_type, media_type)).fetchone()
+        if row:
+            return int(row["id"])
+    return None
     raise HTTPException(400, "The folder is outside the configured media roots")
 
 @app.get("/api/health")
 def health():
     connect().close()
     return {"status": "ok"}
+
+@app.get("/api/network")
+def network_info(request: Request):
+    """Return the server URLs so users know how to connect from other devices."""
+    host = request.client.host if request.client else "localhost"
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        lan_ip = host
+    public_port = int(os.getenv("MEDIA_PUBLIC_PORT", os.getenv("MEDIA_API_PORT", "8080")))
+    domain = os.getenv("DOMAIN", "").strip().lower().removeprefix("http://").removeprefix("https://").rstrip(".")
+    return {
+        "lan_ip": lan_ip,
+        "url_80": f"http://{lan_ip}" if public_port == 80 and lan_ip != "127.0.0.1" else None,
+        "url_8080": f"http://{lan_ip}:{public_port}",
+        "local": f"http://localhost:{public_port}",
+        "domain": domain or None,
+        "domain_url": (f"http://{domain}" if public_port == 80 else f"http://{domain}:{public_port}") if domain else None,
+        "domain_discovery": "mdns" if domain.endswith(".local") else ("external_dns_required" if domain else None),
+    }
 
 @app.get("/api/libraries")
 def libraries():
@@ -736,6 +842,10 @@ def _remove_media_sidecars(file_path: Path, include_artwork: bool) -> None:
 @app.post("/api/media/{media_id}/watched")
 def mark_media_watched(media_id: int, body: WatchedIn):
     conn = connect()
+    circle_id = int(body.circle_id or 1)
+    if not _circle_exists(conn, circle_id):
+        conn.close()
+        raise HTTPException(404, "Circle member not found")
     row = conn.execute("SELECT id,path,file_deleted,folder_path FROM media_items WHERE id=?", (media_id,)).fetchone()
     if not row:
         conn.close()
@@ -761,26 +871,47 @@ def mark_media_watched(media_id: int, body: WatchedIn):
                 conn.close()
                 raise HTTPException(500, f"Could not remove the media file: {exc}") from exc
             _remove_media_sidecars(file_path, include_artwork=False)
-    conn.execute("""UPDATE media_items SET watched=?, watched_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    file_deleted=?, status=CASE WHEN ? THEN 'watched' ELSE CASE WHEN file_deleted THEN 'missing' ELSE 'ready' END END
-                    WHERE id=?""",
-                 (1 if body.watched else 0, 1 if body.watched else 0, 1 if file_deleted else 0, 1 if body.watched else 0, media_id))
     if body.watched:
-        conn.execute("DELETE FROM playback_progress WHERE media_id=?", (media_id,))
+        conn.execute("""INSERT INTO circle_watched(circle_id,media_id,watched,watched_at)
+                        VALUES(?,?,1,CURRENT_TIMESTAMP)
+                        ON CONFLICT(circle_id,media_id) DO UPDATE SET watched=1,watched_at=CURRENT_TIMESTAMP""",
+                     (circle_id, media_id))
+    else:
+        conn.execute("DELETE FROM circle_watched WHERE circle_id=? AND media_id=?", (circle_id, media_id))
+    if circle_id == 1:
+        conn.execute("""UPDATE media_items SET watched=?, watched_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END
+                        WHERE id=?""",
+                     (1 if body.watched else 0, 1 if body.watched else 0, media_id))
+    conn.execute("""UPDATE media_items SET file_deleted=?,
+                    status=CASE WHEN ? THEN 'missing' ELSE 'ready' END
+                    WHERE id=?""",
+                 (1 if file_deleted else 0, 1 if file_deleted else 0, media_id))
+    if body.watched:
+        conn.execute("DELETE FROM circle_playback_progress WHERE circle_id=? AND media_id=?", (circle_id, media_id))
+        if circle_id == 1:
+            conn.execute("DELETE FROM playback_progress WHERE media_id=?", (media_id,))
     conn.commit()
-    updated = conn.execute("SELECT * FROM media_items WHERE id=?", (media_id,)).fetchone()
+    updated = dict(conn.execute("SELECT * FROM media_items WHERE id=?", (media_id,)).fetchone())
+    updated["watched"] = bool(body.watched)
+    watched_row = conn.execute("SELECT watched_at FROM circle_watched WHERE circle_id=? AND media_id=?", (circle_id, media_id)).fetchone()
+    updated["watched_at"] = watched_row["watched_at"] if watched_row else None
     conn.close()
-    return dict(updated)
+    return updated
 
 @app.get("/api/progress/continue")
-def continue_watching():
+def continue_watching(circle_id: int = 1):
     conn = connect()
+    if not _circle_exists(conn, circle_id):
+        conn.close()
+        raise HTTPException(404, "Circle member not found")
     rows = [dict(row) for row in conn.execute("""SELECT media_items.id,media_items.title,media_items.media_type,media_items.metadata,
-               media_items.duration,media_items.watched,media_items.file_deleted,playback_progress.position_ms,
-               playback_progress.duration_ms,playback_progress.updated_at
-        FROM playback_progress JOIN media_items ON media_items.id=playback_progress.media_id
-        WHERE playback_progress.position_ms>0 AND playback_progress.finished=0 AND media_items.watched=0 AND media_items.file_deleted=0
-        ORDER BY playback_progress.updated_at DESC LIMIT 20""")]
+               media_items.duration,COALESCE(circle_watched.watched,0) AS watched,media_items.file_deleted,
+               circle_playback_progress.position_ms,circle_playback_progress.duration_ms,circle_playback_progress.updated_at
+        FROM circle_playback_progress JOIN media_items ON media_items.id=circle_playback_progress.media_id
+        LEFT JOIN circle_watched ON circle_watched.media_id=media_items.id AND circle_watched.circle_id=?
+        WHERE circle_playback_progress.circle_id=? AND circle_playback_progress.position_ms>0
+          AND circle_playback_progress.finished=0 AND COALESCE(circle_watched.watched,0)=0 AND media_items.file_deleted=0
+        ORDER BY circle_playback_progress.updated_at DESC LIMIT 20""", (circle_id, circle_id))]
     conn.close()
     return rows
 @app.delete("/api/media/{media_id}", status_code=204)
@@ -1038,6 +1169,118 @@ def delete_circle_member(circle_id: int):
     if not cursor.rowcount:
         raise HTTPException(404, "Circle member not found")
 
+@app.post("/api/circle/export")
+def export_circle_profiles(body: CircleProfilesTransferIn):
+    conn = connect()
+    profile_ids = list(dict.fromkeys(int(x) for x in body.profile_ids if int(x) > 0))
+    if not profile_ids:
+        profile_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM circle_members ORDER BY id")]
+    placeholders = ",".join("?" for _ in profile_ids)
+    profiles = [dict(row) for row in conn.execute(
+        f"SELECT * FROM circle_members WHERE id IN ({placeholders}) ORDER BY id", profile_ids
+    )]
+    media_rows = {int(row["id"]): _media_catalog_entry(dict(row)) for row in conn.execute(
+        "SELECT id,title,media_type,path,metadata FROM media_items"
+    )}
+    for profile in profiles:
+        circle_id = int(profile["id"])
+        if body.include_scores:
+            profile["scores"] = [dict(row) for row in conn.execute(
+                "SELECT provider,external_id,media_type,title,year,poster_url,backdrop_url,overview,score,notes,created_at,updated_at FROM circle_scores WHERE circle_id=? ORDER BY updated_at DESC",
+                (circle_id,),
+            )]
+        if body.include_watched:
+            watched = []
+            for row in conn.execute("SELECT media_id,watched,watched_at FROM circle_watched WHERE circle_id=? AND watched=1 ORDER BY watched_at DESC", (circle_id,)):
+                entry = {**media_rows.get(int(row["media_id"]), {"media_id": row["media_id"]}), "watched": True, "watched_at": row["watched_at"]}
+                watched.append(entry)
+            profile["watched"] = watched
+        if body.include_progress:
+            progress = []
+            for row in conn.execute("SELECT media_id,position_ms,duration_ms,finished,updated_at FROM circle_playback_progress WHERE circle_id=? ORDER BY updated_at DESC", (circle_id,)):
+                entry = {**media_rows.get(int(row["media_id"]), {"media_id": row["media_id"]}),
+                         "position_ms": row["position_ms"], "duration_ms": row["duration_ms"],
+                         "finished": bool(row["finished"]), "updated_at": row["updated_at"]}
+                progress.append(entry)
+            profile["progress"] = progress
+    conn.close()
+    return {"format": "diwan-circle-profiles-v1",
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "options": {"scores": body.include_scores, "watched": body.include_watched, "progress": body.include_progress},
+            "profiles": profiles}
+
+@app.post("/api/circle/import")
+def import_circle_profiles(body: CircleProfilesImportIn):
+    if body.format != "diwan-circle-profiles-v1":
+        raise HTTPException(400, "Unsupported Circle profile file")
+    conn = connect()
+    selected = set(int(x) for x in body.profile_ids if int(x) > 0)
+    imported = {"profiles": 0, "scores": 0, "watched": 0, "progress": 0}
+    for profile in body.profiles or []:
+        source_id = int(profile.get("id") or 0)
+        if selected and source_id not in selected:
+            continue
+        name = str(profile.get("name") or "").strip()
+        if not name:
+            continue
+        existing = conn.execute("SELECT id FROM circle_members WHERE name=?", (name,)).fetchone()
+        if existing:
+            circle_id = int(existing["id"])
+        else:
+            cursor = conn.execute("INSERT INTO circle_members(name) VALUES(?)", (name,))
+            circle_id = int(cursor.lastrowid)
+            imported["profiles"] += 1
+        if body.include_scores:
+            for score in profile.get("scores") or []:
+                provider = str(score.get("provider") or "").strip().lower()
+                external_id = str(score.get("external_id") or "").strip()
+                if provider not in {"tmdb", "omdb"} or not external_id:
+                    continue
+                value = int(score.get("score") or 0)
+                if value < 1 or value > 10:
+                    continue
+                conn.execute(
+                    """INSERT INTO circle_scores(circle_id,provider,external_id,media_type,title,year,poster_url,backdrop_url,overview,score,notes,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,COALESCE(?,CURRENT_TIMESTAMP),COALESCE(?,CURRENT_TIMESTAMP))
+                       ON CONFLICT(circle_id,provider,external_id) DO UPDATE SET
+                         media_type=excluded.media_type,title=excluded.title,year=excluded.year,
+                         poster_url=excluded.poster_url,backdrop_url=excluded.backdrop_url,
+                         overview=excluded.overview,score=excluded.score,notes=excluded.notes,
+                         updated_at=excluded.updated_at""",
+                    (circle_id, provider, external_id, str(score.get("media_type") or "movie"),
+                     str(score.get("title") or "Untitled"), score.get("year"), score.get("poster_url"),
+                     score.get("backdrop_url"), score.get("overview"), value, score.get("notes"),
+                     score.get("created_at"), score.get("updated_at")),
+                )
+                imported["scores"] += 1
+        if body.include_watched:
+            for item in profile.get("watched") or []:
+                media_id = _find_media_for_profile_entry(conn, item)
+                if not media_id:
+                    continue
+                conn.execute("""INSERT INTO circle_watched(circle_id,media_id,watched,watched_at)
+                                VALUES(?,?,1,COALESCE(?,CURRENT_TIMESTAMP))
+                                ON CONFLICT(circle_id,media_id) DO UPDATE SET watched=1,watched_at=excluded.watched_at""",
+                             (circle_id, media_id, item.get("watched_at")))
+                imported["watched"] += 1
+        if body.include_progress:
+            for item in profile.get("progress") or []:
+                media_id = _find_media_for_profile_entry(conn, item)
+                if not media_id:
+                    continue
+                conn.execute("""INSERT INTO circle_playback_progress(circle_id,media_id,position_ms,duration_ms,finished,updated_at)
+                                VALUES(?,?,?,?,?,COALESCE(?,CURRENT_TIMESTAMP))
+                                ON CONFLICT(circle_id,media_id) DO UPDATE SET
+                                  position_ms=excluded.position_ms,duration_ms=excluded.duration_ms,
+                                  finished=excluded.finished,updated_at=excluded.updated_at""",
+                             (circle_id, media_id, int(item.get("position_ms") or 0),
+                              item.get("duration_ms"), 1 if item.get("finished") else 0,
+                              item.get("updated_at")))
+                imported["progress"] += 1
+    conn.commit()
+    conn.close()
+    return imported
+
 @app.put("/api/settings/scoring")
 def save_scoring_settings(body: ScoringSettingsIn):
     if body.mode not in {"average", "member"}:
@@ -1255,9 +1498,134 @@ def content_filter_settings():
 @app.put("/api/settings/content-filter")
 def update_content_filter_settings(body: ContentFilterSettingsIn):
     try:
-        return save_filter_settings(body.policy, body.sensitivity, body.auto_analyze)
+        return save_filter_settings(body.policy, body.sensitivity, body.auto_analyze, body.model_key,
+                                    body.confirmation, body.controls_timeout_seconds)
     except AnalysisError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+@app.get("/api/content-filter/export")
+def export_content_filters():
+    """Portable policy plus precomputed timelines for low-powered servers."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """SELECT m.id,m.title,m.path,m.size,m.duration,mo.model_key AS media_model_key,
+                      s.category,s.start_ms,s.end_ms,
+                      s.confidence,s.detector,s.model_version,COALESCE(o.enabled,1) AS enabled
+                FROM media_items m JOIN content_segments s ON s.media_id=m.id
+                LEFT JOIN media_filter_model_overrides mo ON mo.media_id=m.id
+                LEFT JOIN content_segment_overrides o ON o.segment_id=s.id
+                ORDER BY m.id,s.start_ms"""
+        ).fetchall()
+        review_rows = conn.execute(
+            """SELECT m.id,m.path,m.size,r.category,r.start_ms,r.end_ms,r.enabled,r.note
+               FROM media_items m JOIN content_segment_reviews r ON r.media_id=m.id
+               ORDER BY m.id,r.start_ms"""
+        ).fetchall()
+        grouped: dict[int, dict] = {}
+        for row in rows:
+            media = grouped.setdefault(int(row["id"]), {
+                "title": row["title"], "filename": Path(row["path"]).name,
+                "size": int(row["size"] or 0), "duration": row["duration"],
+                "model_key": row["media_model_key"], "segments": [], "reviews": [],
+            })
+            media["segments"].append({key: row[key] for key in (
+                "category", "start_ms", "end_ms", "confidence", "detector", "model_version", "enabled"
+            )})
+        for row in review_rows:
+            media = grouped.setdefault(int(row["id"]), {
+                "title": "", "filename": Path(row["path"]).name,
+                "size": int(row["size"] or 0), "duration": None,
+                "model_key": None, "segments": [], "reviews": [],
+            })
+            media["reviews"].append({key: row[key] for key in (
+                "category", "start_ms", "end_ms", "enabled", "note"
+            )})
+        settings = get_filter_settings()
+        settings.pop("categories", None)
+        settings.pop("models", None)
+        return {"format": "diwan-content-filter-v2", "exported_at": datetime.now(timezone.utc).isoformat(),
+                "settings": settings, "media": list(grouped.values())}
+    finally:
+        conn.close()
+
+@app.post("/api/content-filter/import")
+def import_content_filters(body: ContentFilterImportIn):
+    if body.format not in {"diwan-content-filter-v1", "diwan-content-filter-v2"}:
+        raise HTTPException(400, "Unsupported filter file format")
+    settings = body.settings or {}
+    try:
+        save_filter_settings(settings.get("policy", {}), settings.get("sensitivity", "balanced"),
+                             bool(settings.get("auto_analyze", False)),
+                             str(settings.get("model_key") or "nudenet_openclip"),
+                             settings.get("confirmation", {}),
+                             int(settings.get("controls_timeout_seconds", 3)))
+    except (AnalysisError, TypeError, ValueError) as exc:
+        raise HTTPException(400, f"Invalid filter settings: {exc}") from exc
+    conn = connect()
+    imported = 0
+    try:
+        revision_row = conn.execute("SELECT value FROM settings WHERE key='content_filter_revision'").fetchone()
+        settings_revision = int(revision_row["value"]) if revision_row else 1
+        valid_categories = {definition["key"] for definition in category_definitions()}
+        for item in body.media:
+            filename, size = str(item.get("filename") or ""), int(item.get("size") or 0)
+            matches = conn.execute("SELECT id,path FROM media_items WHERE size=?", (size,)).fetchall()
+            media_id = next((int(row["id"]) for row in matches if Path(row["path"]).name == filename), None)
+            if media_id is None:
+                continue
+            segments = item.get("segments") or []
+            reviews = item.get("reviews") or []
+            conn.execute("DELETE FROM content_segments WHERE media_id=?", (media_id,))
+            conn.execute("DELETE FROM content_segment_reviews WHERE media_id=?", (media_id,))
+            if item.get("model_key"):
+                conn.execute(
+                    """INSERT INTO media_filter_model_overrides(media_id,model_key)
+                       VALUES(?,?) ON CONFLICT(media_id) DO UPDATE SET model_key=excluded.model_key""",
+                    (media_id, str(item.get("model_key"))),
+                )
+            for segment in segments:
+                category = str(segment.get("category") or "")
+                if category not in valid_categories:
+                    continue
+                start_ms = max(0, int(segment.get("start_ms") or 0))
+                end_ms = max(0, int(segment.get("end_ms") or 0))
+                if end_ms <= start_ms:
+                    continue
+                cursor = conn.execute(
+                    """INSERT INTO content_segments(media_id,category,start_ms,end_ms,confidence,detector,model_version)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (media_id, category, start_ms, end_ms, float(segment.get("confidence") or 0),
+                     str(segment.get("detector") or "imported"), str(segment.get("model_version") or MODEL_VERSION)),
+                )
+                if not bool(segment.get("enabled", True)):
+                    conn.execute("INSERT INTO content_segment_overrides(segment_id,enabled) VALUES(?,0)", (cursor.lastrowid,))
+            for review in reviews:
+                category = str(review.get("category") or "")
+                if category not in valid_categories:
+                    continue
+                start_ms = max(0, int(review.get("start_ms") or 0))
+                end_ms = max(start_ms + 1, int(review.get("end_ms") or 0))
+                conn.execute(
+                    """INSERT INTO content_segment_reviews(media_id,category,start_ms,end_ms,enabled,note)
+                       VALUES(?,?,?,?,?,?)""",
+                    (media_id, category, start_ms, end_ms, 1 if bool(review.get("enabled", True)) else 0,
+                     str(review.get("note") or "") or None),
+                )
+            conn.execute(
+                """INSERT INTO content_analysis_jobs(media_id,status,progress,message,categories,model_version,settings_revision,completed_at)
+                   VALUES(?,'completed',1,'Imported filter timeline',?,?,?,CURRENT_TIMESTAMP)
+                   ON CONFLICT(media_id) DO UPDATE SET status='completed',progress=1,message='Imported filter timeline',
+                     categories=excluded.categories,model_version=excluded.model_version,
+                     settings_revision=excluded.settings_revision,completed_at=CURRENT_TIMESTAMP""",
+                (media_id, json.dumps(sorted({s.get("category") for s in segments if s.get("category")})),
+                 (segments[0].get("model_version") if segments else MODEL_VERSION), settings_revision),
+            )
+            imported += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return {"settings": get_filter_settings(), "media_imported": imported, "media_in_file": len(body.media)}
 
 @app.get("/api/media/{media_id}/content-analysis")
 def get_content_analysis(media_id: int):
@@ -1269,7 +1637,22 @@ def get_content_analysis(media_id: int):
 @app.put("/api/media/{media_id}/content-segments/{segment_id}")
 def update_content_segment_override(media_id: int, segment_id: int, body: ContentSegmentOverrideIn):
     try:
+        if segment_id < 0:
+            payload = analysis_payload(media_id)
+            segment = next((item for item in payload.get("segments", []) if int(item.get("id")) == segment_id), None)
+            if not segment:
+                raise AnalysisError("Detected scene not found")
+            return save_content_range_review(media_id, str(segment["category"]), int(segment["start_ms"]),
+                                             int(segment["end_ms"]), body.enabled,
+                                             "Verified from confirmed segment")
         return save_content_segment_override(media_id, segment_id, body.enabled)
+    except AnalysisError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+@app.post("/api/media/{media_id}/content-range-review")
+def review_content_range(media_id: int, body: ContentRangeReviewIn):
+    try:
+        return save_content_range_review(media_id, body.category, body.start_ms, body.end_ms, body.enabled, body.note)
     except AnalysisError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1280,10 +1663,19 @@ def update_media_filter_overrides(media_id: int, body: MediaFilterOverridesIn):
     except AnalysisError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+@app.put("/api/media/{media_id}/content-filter-model")
+def update_media_filter_model(media_id: int, body: MediaFilterModelIn):
+    try:
+        return save_media_filter_model(media_id, body.model_key)
+    except AnalysisError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
 @app.post("/api/media/{media_id}/content-analysis", status_code=202)
 def start_content_analysis(media_id: int, body: ContentAnalysisIn):
     try:
-        return enqueue_analysis(media_id, body.categories, body.sample_interval)
+        return enqueue_analysis(media_id, categories=body.categories, model_key=body.model_key,
+                                model_keys=body.model_keys,
+                                sample_interval=body.sample_interval)
     except AnalysisError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1425,13 +1817,20 @@ def download_to_media_folder(media_id: int, body: MediaDirectUrlIn):
 
 
 @app.get("/api/media")
-def media(q: str | None = None, media_type: str | None = None):
+def media(q: str | None = None, media_type: str | None = None, circle_id: int = 1):
     conn = connect()
-    sql = """SELECT media_items.id,title,media_type,size,modified,duration,width,height,status,metadata,watched,file_deleted,watched_at,
+    if not _circle_exists(conn, circle_id):
+        conn.close()
+        raise HTTPException(404, "Circle member not found")
+    sql = """SELECT media_items.id,title,media_type,size,modified,duration,width,height,status,metadata,
+             COALESCE(circle_watched.watched,0) AS watched,media_items.file_deleted,circle_watched.watched_at,
+             circle_playback_progress.position_ms,circle_playback_progress.duration_ms,
              parent_id,season_number,episode_number,entry_origin,
              libraries.name AS library_name,media_items.path AS file_path FROM media_items
-             JOIN libraries ON libraries.id=media_items.library_id"""
-    args, clauses = [], ["parent_id IS NULL"]
+             JOIN libraries ON libraries.id=media_items.library_id
+             LEFT JOIN circle_watched ON circle_watched.media_id=media_items.id AND circle_watched.circle_id=?
+             LEFT JOIN circle_playback_progress ON circle_playback_progress.media_id=media_items.id AND circle_playback_progress.circle_id=?"""
+    args, clauses = [circle_id, circle_id], ["parent_id IS NULL"]
     if q:
         clauses.append("title LIKE ?")
         args.append(f"%{q}%")
@@ -1448,9 +1847,18 @@ def media(q: str | None = None, media_type: str | None = None):
     return rows
 
 @app.get("/api/media/{media_id}")
-def media_detail(media_id: int):
+def media_detail(media_id: int, circle_id: int = 1):
     conn = connect()
-    row = conn.execute("SELECT * FROM media_items WHERE id=?", (media_id,)).fetchone()
+    if not _circle_exists(conn, circle_id):
+        conn.close()
+        raise HTTPException(404, "Circle member not found")
+    row = conn.execute("""SELECT media_items.*,COALESCE(circle_watched.watched,0) AS watched,
+                          circle_watched.watched_at,circle_playback_progress.position_ms,
+                          circle_playback_progress.duration_ms
+                          FROM media_items
+                          LEFT JOIN circle_watched ON circle_watched.media_id=media_items.id AND circle_watched.circle_id=?
+                          LEFT JOIN circle_playback_progress ON circle_playback_progress.media_id=media_items.id AND circle_playback_progress.circle_id=?
+                          WHERE media_items.id=?""", (circle_id, circle_id, media_id)).fetchone()
     conn.close()
     if not row:
         raise HTTPException(404, "Media not found")
@@ -1492,7 +1900,88 @@ def stream_media(media_id: int, request: Request):
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(chunk_size),
             })
-    return FileResponse(file_path, media_type=content_type)
+    return FileResponse(file_path, media_type=content_type, headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)})
+
+
+def _media_file(media_id: int) -> Path:
+    conn = connect()
+    row = conn.execute("SELECT path FROM media_items WHERE id=?", (media_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "Media not found")
+    file_path = Path(row["path"])
+    if not file_path.is_file():
+        raise HTTPException(404, "File not found on disk")
+    return file_path
+
+
+@app.get("/api/media/{media_id}/playback")
+def media_playback_plan(media_id: int, request: Request):
+    """Choose direct play or a webOS-safe H.264/AAC compatibility stream."""
+    file_path = _media_file(media_id)
+    probe = FFPROBE_PATH if Path(FFPROBE_PATH).exists() else "ffprobe"
+    video_codec = audio_codec = ""
+    try:
+        result = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+             "-of", "json", str(file_path)], capture_output=True, text=True, timeout=15, check=True,
+        )
+        for stream in json.loads(result.stdout).get("streams", []):
+            if stream.get("codec_type") == "video" and not video_codec:
+                video_codec = str(stream.get("codec_name") or "")
+            elif stream.get("codec_type") == "audio" and not audio_codec:
+                audio_codec = str(stream.get("codec_name") or "")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+    user_agent = request.headers.get("user-agent", "").lower()
+    webos = "web0s" in user_agent or "webos" in user_agent or "netcast" in user_agent
+    direct = file_path.suffix.lower() in {".mp4", ".m4v"} and video_codec in {"h264", "avc1"} and audio_codec in {"aac", "mp3", ""}
+    if not webos and file_path.suffix.lower() == ".webm":
+        direct = video_codec in {"vp8", "vp9", "av1"} and audio_codec in {"opus", "vorbis", ""}
+    return {
+        "mode": "direct" if direct else "compatibility",
+        "url": f"/api/media/{media_id}/stream" if direct else f"/api/media/{media_id}/stream-compatible.mp4",
+        "fallback_url": f"/api/media/{media_id}/stream-compatible.mp4",
+        "container": file_path.suffix.lower().lstrip("."), "video_codec": video_codec,
+        "audio_codec": audio_codec, "webos": webos,
+    }
+
+
+@app.get("/api/media/{media_id}/stream-compatible.mp4")
+def stream_media_compatible(media_id: int, start: float = 0):
+    """Transmux/transcode to fragmented MP4 understood by webOS and other TVs."""
+    file_path = _media_file(media_id)
+    ffmpeg = FFMPEG_PATH if Path(FFMPEG_PATH).exists() else "ffmpeg"
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+    if start > 0:
+        command += ["-ss", str(max(0.0, start))]
+    command += [
+        "-i", str(file_path), "-map", "0:v:0", "-map", "0:a:0?", "-sn",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+        "-profile:v", "high", "-level", "4.1", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1",
+    ]
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise HTTPException(503, f"Compatibility playback needs FFmpeg: {exc}") from exc
+
+    def output():
+        try:
+            assert process.stdout is not None
+            while chunk := process.stdout.read(256 * 1024):
+                yield chunk
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    return StreamingResponse(output(), media_type="video/mp4", headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @app.get("/api/media/{media_id}/poster")
@@ -1754,13 +2243,16 @@ def download_media_subtitle(media_id: int, body: MediaSubtitleDownloadIn):
     _write_subtitle_state(media_path, state)
     return {**state, "saved": str(target), "track_url": f"/api/media/{media_id}/subtitles/active/file"}
 @app.get("/api/media/{media_id}/progress")
-def get_playback_progress(media_id: int):
+def get_playback_progress(media_id: int, circle_id: int = 1):
     conn = connect()
+    if not _circle_exists(conn, circle_id):
+        conn.close()
+        raise HTTPException(404, "Circle member not found")
     media = conn.execute("SELECT id, duration FROM media_items WHERE id=?", (media_id,)).fetchone()
     if not media:
         conn.close()
         raise HTTPException(404, "Media not found")
-    row = conn.execute("SELECT media_id, position_ms, duration_ms, finished, updated_at FROM playback_progress WHERE media_id=?", (media_id,)).fetchone()
+    row = conn.execute("SELECT media_id, position_ms, duration_ms, finished, updated_at FROM circle_playback_progress WHERE circle_id=? AND media_id=?", (circle_id, media_id)).fetchone()
     conn.close()
     if not row:
         duration_ms = int((media["duration"] or 0) * 1000) if media["duration"] else None
@@ -1770,7 +2262,7 @@ def get_playback_progress(media_id: int):
     return data
 
 @app.put("/api/media/{media_id}/progress")
-def save_playback_progress(media_id: int, body: PlaybackProgressIn):
+def save_playback_progress(media_id: int, body: PlaybackProgressIn, circle_id: int = 1):
     position_ms = max(0, int(body.position_ms or 0))
     duration_ms = int(body.duration_ms) if body.duration_ms else None
     finished = 1 if body.finished else 0
@@ -1779,24 +2271,40 @@ def save_playback_progress(media_id: int, body: PlaybackProgressIn):
     if finished:
         position_ms = 0
     conn = connect()
+    if not _circle_exists(conn, circle_id):
+        conn.close()
+        raise HTTPException(404, "Circle member not found")
     media = conn.execute("SELECT id FROM media_items WHERE id=?", (media_id,)).fetchone()
     if not media:
         conn.close()
         raise HTTPException(404, "Media not found")
     conn.execute(
         """
-        INSERT INTO playback_progress(media_id, position_ms, duration_ms, finished, updated_at)
-        VALUES(?,?,?,?,CURRENT_TIMESTAMP)
-        ON CONFLICT(media_id) DO UPDATE SET
+        INSERT INTO circle_playback_progress(circle_id, media_id, position_ms, duration_ms, finished, updated_at)
+        VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(circle_id,media_id) DO UPDATE SET
             position_ms=excluded.position_ms,
             duration_ms=excluded.duration_ms,
             finished=excluded.finished,
             updated_at=CURRENT_TIMESTAMP
         """,
-        (media_id, position_ms, duration_ms, finished),
+        (circle_id, media_id, position_ms, duration_ms, finished),
     )
+    if circle_id == 1:
+        conn.execute(
+            """
+            INSERT INTO playback_progress(media_id, position_ms, duration_ms, finished, updated_at)
+            VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+            ON CONFLICT(media_id) DO UPDATE SET
+                position_ms=excluded.position_ms,
+                duration_ms=excluded.duration_ms,
+                finished=excluded.finished,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (media_id, position_ms, duration_ms, finished),
+        )
     conn.commit()
-    row = conn.execute("SELECT media_id, position_ms, duration_ms, finished, updated_at FROM playback_progress WHERE media_id=?", (media_id,)).fetchone()
+    row = conn.execute("SELECT media_id, position_ms, duration_ms, finished, updated_at FROM circle_playback_progress WHERE circle_id=? AND media_id=?", (circle_id, media_id)).fetchone()
     conn.close()
     data = dict(row)
     data["finished"] = bool(data.get("finished"))
@@ -1827,17 +2335,3 @@ def frontend(path: str = ""):
         mt = "text/html; charset=utf-8" if requested.suffix.lower() == ".html" else None
         return FileResponse(requested, media_type=mt)
     return FileResponse(WEB / "index.html", media_type="text/html; charset=utf-8")
-
-
-
-
-
-
-
-
-
-
-
-
-
-

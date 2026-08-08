@@ -40,6 +40,18 @@ def resolve_embed_to_stream(embed_url: str, max_wait: int = 15) -> str | None:
 
     page.on("popup", _handle_popup)
 
+    def _block_ads(route):
+        url_lower = route.request.url.lower()
+        if any(d in url_lower for d in ("adexchange", "popunder", "notification", "/ads/", "gambling", "bonus-stars", "ad.")):
+            route.abort()
+        else:
+            route.continue_()
+
+    try:
+        page.route("**/*", _block_ads)
+    except Exception:
+        pass
+
     try:
         page.goto(embed_url, wait_until="domcontentloaded", timeout=15000)
         logger.info("Embed resolver: page loaded")

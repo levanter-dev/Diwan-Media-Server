@@ -8,7 +8,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.PORT || 8080);
 const apiHost = process.env.MEDIA_API_HOST || "127.0.0.1";
 const apiPort = Number(process.env.MEDIA_API_PORT || 8081);
-const domain = process.env.DOMAIN || "";
+const domain = (process.env.DOMAIN || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\.$/, "");
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -39,7 +39,7 @@ function startMdns() {
   const ip = lanIPv4();
   if (!ip) return;
 
-  // Dynamic import — multicast-dns is ESM-only in recent versions
+  // Dynamic import  -  multicast-dns is ESM-only in recent versions
   import("multicast-dns").then(({ default: createMdns }) => {
     mdns = createMdns();
     mdns.on("query", (query) => {
@@ -49,9 +49,9 @@ function startMdns() {
         }
       }
     });
-    mdns.on("error", () => { /* mDNS port may be in use — silently ignore */ });
-    console.log(`mDNS: ${domain} → ${ip}`);
-  }).catch(() => { /* multicast-dns not installed — skip */ });
+    mdns.on("error", () => { /* mDNS port may be in use  -  silently ignore */ });
+    console.log(`mDNS: ${domain} -> ${ip}`);
+  }).catch(() => { /* multicast-dns not installed  -  skip */ });
 }
 
 function stopMdns() {
@@ -76,7 +76,7 @@ function proxy(request, response) {
   request.pipe(upstream);
 }
 
-http.createServer((request, response) => {
+function handleRequest(request, response) {
   if (request.url.startsWith("/api/")) return proxy(request, response);
   const pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
   const candidate = path.resolve(root, `.${pathname}`);
@@ -84,10 +84,12 @@ http.createServer((request, response) => {
   const file = safe ? candidate : path.join(root, "index.html");
   response.writeHead(200, { "Content-Type": contentTypes[path.extname(file)] || "application/octet-stream", "Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0" });
   fs.createReadStream(file).pipe(response);
-}).listen(port, "0.0.0.0", () => {
+}
+
+http.createServer(handleRequest).listen(port, "0.0.0.0", () => {
   if (domain) startMdns();
   const addrs = [];
-  if (domain) addrs.push(`http://${domain}:${port}`);
+  if (domain) addrs.push(`http://${domain}${port === 80 ? '' : ':' + port}`);
   addrs.push(`http://localhost:${port}`);
   const nets = os.networkInterfaces();
   for (const iface of Object.values(nets)) {
@@ -96,6 +98,15 @@ http.createServer((request, response) => {
     }
   }
   console.log(`Media portal: ${addrs.join("  |  ")}`);
+
+  // If a custom domain is set, also serve directly on port 80 (no port in URL).
+  if (domain && port !== 80) {
+    const server80 = http.createServer(handleRequest);
+    server80.on("error", error => { console.warn(`Could not listen on port 80 for ${domain}: ${error.message}. Use http://${domain}:${port}`); });
+    server80.listen(80, "0.0.0.0", () => {
+      console.log(`Also serving on http://${domain}`);
+    });
+  }
 });
 
 process.on("SIGINT", () => { stopMdns(); process.exit(); });

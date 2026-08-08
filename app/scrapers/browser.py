@@ -15,7 +15,7 @@ from .models import ServerSource
 
 logger = logging.getLogger(__name__)
 
-_MAX_BROWSERS = int(os.environ.get("SCRAPE_MAX_BROWSERS", "7"))
+_MAX_BROWSERS = int(os.environ.get("SCRAPE_MAX_BROWSERS", "3"))
 _browser_semaphore = threading.BoundedSemaphore(_MAX_BROWSERS)
 
 
@@ -84,7 +84,7 @@ class BrowserPool:
     def _new_page(self, timeout: int = 30000):
         self._ensure_browser()
         if not self._browser:
-            raise BrowserError("Browser not initialized — previous launch may have failed")
+            raise BrowserError("Browser not initialized  -  previous launch may have failed")
         context = self._browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
@@ -172,7 +172,7 @@ class BrowserPool:
                     timeout=8000,
                 )
             except Exception:
-                logger.info("No video/iframe selectors appeared within 8s — continuing")
+                logger.info("No video/iframe selectors appeared within 8s  -  continuing")
             time.sleep(3)
 
             page_html = page.content()
@@ -188,7 +188,7 @@ class BrowserPool:
             if not mp4_urls:
                 mp4_urls = _extract_mp4_from_iframes(page, page_url)
         except Exception as exc:
-            logger.warning("Page load failed for %s: %s — skipping", page_url, exc)
+            logger.warning("Page load failed for %s: %s  -  skipping", page_url, exc)
             page_html = ""
         finally:
             try:

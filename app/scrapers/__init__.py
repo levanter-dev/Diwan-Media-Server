@@ -14,20 +14,16 @@ _registry: list[BaseAdapter] = []
 
 ADAPTER_TIMEOUT = int(os.environ.get("SCRAPE_ADAPTER_TIMEOUT", "20"))
 
-# Scrapers are optional — they ship as local-only files not tracked in git.
+# Scrapers are optional  -  they ship as local-only files not tracked in git.
 # See LOCAL_SETUP.md for how to restore them.
 try:
-    from .larroza import LarrozaAdapter
-    from .shahid import ShahidAdapter
     from .ramoflix import RamoflixAdapter
-    from .shuttletv import ShuttleTVAdapter
     from .aether import AetherAdapter
     from .soap2day import Soap2dayAdapter
-    from .hdtoday import HDTodayAdapter
     _SCRAPERS_AVAILABLE = True
 except ImportError:
     _SCRAPERS_AVAILABLE = False
-    logger.info("Scraper adapters not found — download/redownload features will be unavailable.")
+    logger.info("Scraper adapters not found  -  download/redownload features will be unavailable.")
 
 
 def _ensure_registry() -> None:
@@ -35,40 +31,20 @@ def _ensure_registry() -> None:
         return
     if not _SCRAPERS_AVAILABLE:
         return
-    from .larroza import LARROZA_BASE
-    adapter = LarrozaAdapter()
-    _registry.append(adapter)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter.adapter_name, adapter.adapter_id, LARROZA_BASE)
-
-    from .shahid import SHAHID_BASE as _SHAHID_BASE
-    adapter2 = ShahidAdapter()
-    _registry.append(adapter2)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter2.adapter_name, adapter2.adapter_id, _SHAHID_BASE)
-
     from .ramoflix import RAMOFLIX_BASE as _RAMOFLIX_BASE
-    adapter3 = RamoflixAdapter()
-    _registry.append(adapter3)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter3.adapter_name, adapter3.adapter_id, _RAMOFLIX_BASE)
-
-    from .shuttletv import SHUTTLETV_BASE as _SHUTTLETV_BASE
-    adapter4 = ShuttleTVAdapter()
-    _registry.append(adapter4)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter4.adapter_name, adapter4.adapter_id, _SHUTTLETV_BASE)
+    adapter = RamoflixAdapter()
+    _registry.append(adapter)
+    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter.adapter_name, adapter.adapter_id, _RAMOFLIX_BASE)
 
     from .aether import AETHER_BASE as _AETHER_BASE
-    adapter5 = AetherAdapter()
-    _registry.append(adapter5)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter5.adapter_name, adapter5.adapter_id, _AETHER_BASE)
+    adapter2 = AetherAdapter()
+    _registry.append(adapter2)
+    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter2.adapter_name, adapter2.adapter_id, _AETHER_BASE)
 
     from .soap2day import SOAP2DAY_BASE as _SOAP2DAY_BASE
-    adapter6 = Soap2dayAdapter()
-    _registry.append(adapter6)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter6.adapter_name, adapter6.adapter_id, _SOAP2DAY_BASE)
-
-    from .hdtoday import HDTODAY_BASE as _HDTODAY_BASE
-    adapter7 = HDTodayAdapter()
-    _registry.append(adapter7)
-    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter7.adapter_name, adapter7.adapter_id, _HDTODAY_BASE)
+    adapter3 = Soap2dayAdapter()
+    _registry.append(adapter3)
+    logger.info("Registered scraper adapter: %s (id=%s, base=%s)", adapter3.adapter_name, adapter3.adapter_id, _SOAP2DAY_BASE)
 
 
 def get_adapters() -> list[BaseAdapter]:

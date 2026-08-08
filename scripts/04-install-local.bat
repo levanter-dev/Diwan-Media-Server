@@ -26,6 +26,11 @@ if errorlevel 8 (
   exit /b 1
 )
 
+if exist "%CD%\.env" (
+  if not exist "%LOCALAPPDATA%\LocalMediaServer" mkdir "%LOCALAPPDATA%\LocalMediaServer"
+  copy /Y "%CD%\.env" "%LOCALAPPDATA%\LocalMediaServer\.env" >nul
+)
+
 schtasks /Create /TN "%TASK_NAME%" /SC ONLOGON /TR "\"%INSTALL_EXE%\"" /RL LIMITED /F >nul 2>nul
 if errorlevel 1 (
   powershell.exe -NoProfile -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut('%STARTUP_LINK%');$s.TargetPath='%INSTALL_EXE%';$s.WorkingDirectory='%INSTALL_DIR%';$s.Save()"

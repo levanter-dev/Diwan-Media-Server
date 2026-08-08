@@ -3,9 +3,18 @@ import string
 import sys
 from pathlib import Path
 
-_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
-if _ENV_FILE.exists():
-    with open(_ENV_FILE, "r", encoding="utf-8") as _f:
+_source_env = Path(__file__).resolve().parent.parent / ".env"
+_env_files = [_source_env]
+if getattr(sys, "frozen", False):
+    _env_files = [
+        Path(os.getenv("LOCALAPPDATA", Path.home())) / "LocalMediaServer" / ".env",
+        Path(sys.executable).resolve().parent / ".env",
+        _source_env,
+    ]
+for _env_file in _env_files:
+    if not _env_file.exists():
+        continue
+    with open(_env_file, "r", encoding="utf-8") as _f:
         for _line in _f:
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:

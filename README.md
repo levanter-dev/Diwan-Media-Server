@@ -7,23 +7,23 @@ detects and filters NSFW and inappropriate scenes.
 
 ## Features
 
-- **Local media library** — Scan Windows drives and folders; organize movies, series, and audio
-- **Explore catalogue** — Search TMDB and OMDb for movies/series, browse trending and popular rows
-- **Personal scoring** — Rate titles 1–10 to build a taste profile for recommendations
-- **In-page video player** — Play media directly with subtitle overlay, seek controls, and progress saving
-- **Subtitle search** — Find and download subtitles from OpenSubtitles, with language filter
-- **AI content filtering** — Automatically detect and skip/warn/mark NSFW, nudity, and inappropriate scenes using on-device AI (no cloud)
-- **Multi-device** — Access from any device on your local network (phone, tablet, TV)
-- **Circle scoring** — Multiple household members can maintain independent scores
+- **Local media library**  -  Scan Windows drives and folders; organize movies, series, and audio
+- **Explore catalogue**  -  Search TMDB and OMDb for movies/series, browse trending and popular rows
+- **Personal scoring**  -  Rate titles 1-10 to build a taste profile for recommendations
+- **In-page video player**  -  Play media directly with subtitle overlay, seek controls, and progress saving
+- **Subtitle search**  -  Find and download subtitles from OpenSubtitles, with language filter
+- **AI content filtering**  -  Automatically detect and skip/warn/mark NSFW, nudity, and inappropriate scenes using on-device AI (no cloud)
+- **Multi-device**  -  Access from any device on your local network (phone, tablet, TV)
+- **Circle scoring**  -  Multiple household members can maintain independent scores
 
 ## Quick Start
 
 ### Prerequisites
 
 - **Windows 10 or 11**
-- **Python 3.12+** — [python.org](https://www.python.org/downloads/)
-- **Node.js 20+** — [nodejs.org](https://nodejs.org/)
-- **FFmpeg** (for the packaged build) — place ffmpeg.exe and ffprobe.exe in vendor/ffmpeg/bin/
+- **Python 3.12+**  -  [python.org](https://www.python.org/downloads/)
+- **Node.js 20+**  -  [nodejs.org](https://nodejs.org/)
+- **FFmpeg** (for the packaged build)  -  place ffmpeg.exe and ffprobe.exe in vendor/ffmpeg/bin/
 
 ### 1. Clone and configure
 
@@ -51,8 +51,13 @@ On other devices, open `http://<your-pc-ip>:8080` (e.g. `http://192.168.1.50:808
 
 To use a friendly name instead of an IP, set `DOMAIN=diwan.local` in your `.env`
 file. The server automatically advertises the name via mDNS (Bonjour/Zeroconf) so
-any device on your network can reach it at `http://diwan.local:8080` — no hosts
+any device on your network can reach it at `http://diwan.local:8080`  -  no hosts
 file editing or router config required.
+
+Use the `:8080` form unless the server reports that it successfully opened port
+80. Some webOS versions do not resolve mDNS names; in that case use the displayed
+LAN IP or add `diwan.local` to your router's local DNS. A name that does not end in
+`.local` always needs a router/DNS/hosts record.
 
 Press **Ctrl+C** to stop both servers.
 
@@ -86,9 +91,9 @@ Diwan uses three external services. All are free.
 Used for search, posters, metadata, and discovery rows (trending, popular, now playing).
 
 1. Sign up at [themoviedb.org](https://www.themoviedb.org/signup)
-2. Go to [Settings → API](https://www.themoviedb.org/settings/api)
-3. Request an API key — choose **Developer**
-4. Copy the **API Read Access Token (v4 auth)** — starts with `eyJ...`
+2. Go to [Settings -> API](https://www.themoviedb.org/settings/api)
+3. Request an API key  -  choose **Developer**
+4. Copy the **API Read Access Token (v4 auth)**  -  starts with `eyJ...`
 5. Add to `.env`: `TMDB_TOKEN=eyJ...`
 
 > This product uses the TMDB API but is not endorsed or certified by TMDB.
@@ -121,11 +126,11 @@ Subtitle search and download.
 
 ## AI Content Filtering
 
-Diwan uses on-device AI to detect and handle inappropriate scenes — no files
+Diwan uses on-device AI to detect and handle inappropriate scenes  -  no files
 are uploaded to any cloud service. Two AI models run locally:
 
-- **[NudeNet](https://github.com/notAI-tech/NudeNet)** — detects exposed body parts (anatomy)
-- **[OpenCLIP (ViT-B-32)](https://github.com/mlfoundations/open_clip)** — understands scene context (activity, attire, kissing)
+- **[NudeNet](https://github.com/notAI-tech/NudeNet)**  -  detects exposed body parts (anatomy)
+- **[OpenCLIP (ViT-B-32)](https://github.com/mlfoundations/open_clip)**  -  understands scene context (activity, attire, kissing)
 
 ### Detected categories
 
@@ -154,6 +159,43 @@ Each category can be independently set to one of four modes:
 Three sensitivity levels control the detection threshold: **Low** (fewer false
 positives), **Balanced**, and **High** (catches more borderline scenes).
 
+### Model selection
+
+Settings can choose the global analysis model, and each media details page can
+override that model before re-filtering a title.
+
+| Model | Best use |
+|---|---|
+| NudeNet + OpenCLIP | Broadest coverage: anatomy plus scene context |
+| NudeNet only | More predictable body-part detection with fewer context false positives |
+| NudeNet strict private-parts | Highest precision for generic nudity; breasts stay separate from private-parts nudity |
+| OpenCLIP prompts only | Experimental markers for scene context; avoid for automatic skips |
+| GantMan NSFW model | Optional broad NSFW classifier; requires `nsfw_detector`, TensorFlow, and `NSFW_MODEL_PATH` |
+| HaramBlur-style NSFWJS | Server-side NSFWJS/GantMan-style classifier profile; HaramBlur itself also uses browser face detection through Human.js |
+
+### Confirmation pipeline
+
+The confirmation sandbox can require multiple model profiles to agree within a
+time window before a detected segment is used for automatic skipping. A single
+model can still pass if its confidence is above the configured high-confidence
+threshold. Media pages can also run all installed model profiles, compare raw
+segments by model, and manually verify an exact time range as blocked or safe.
+
+Filter export/import uses the v2 format and includes the global confirmation
+settings, per-media model overrides, raw per-model timelines, and manual
+verification ranges.
+
+Detection is intentionally precision-first for automatic skips and requires
+corroborating frames. No visual classifier can promise 100% accuracy, so detected
+scenes can be marked safe and automatic skipping can be replaced with warnings or
+timeline markers for categories where false positives are unacceptable.
+
+### Portable filters
+
+Settings can export a JSON filter file containing the policy and all prepared
+scene timelines. Importing it on another Diwan server matches media by filename
+and size, allowing a fast computer to do the analysis for a lower-powered one.
+
 ### GPU acceleration
 
 Content analysis runs significantly faster with an NVIDIA GPU (CUDA).
@@ -167,19 +209,23 @@ shows whether GPU acceleration is available.
 3. During playback, detected scenes are handled according to your settings
 4. You can override filters per media item from the media details page
 
+During playback, unsupported containers/codecs are converted to an H.264/AAC
+compatibility stream for webOS and other TVs. This is server-side playback
+compatibility; the custom controls alone cannot add codec support to a TV.
+
 ## Configuration
 
 All settings go in `.env`. See `.env.example` for the full list.
 
 | Variable | Default | Description |
 |---|---|---|
-| `TMDB_TOKEN` | — | TMDB API Read Access Token |
-| `OMDB_API_KEY` | — | OMDb API key |
-| `OPENSUBTITLES_USERNAME` | — | OpenSubtitles username |
-| `OPENSUBTITLES_PASSWORD` | — | OpenSubtitles password |
-| `OPENSUBTITLES_API_KEY` | — | OpenSubtitles consumer API key |
+| `TMDB_TOKEN` |  -  | TMDB API Read Access Token |
+| `OMDB_API_KEY` |  -  | OMDb API key |
+| `OPENSUBTITLES_USERNAME` |  -  | OpenSubtitles username |
+| `OPENSUBTITLES_PASSWORD` |  -  | OpenSubtitles password |
+| `OPENSUBTITLES_API_KEY` |  -  | OpenSubtitles consumer API key |
 | `PORT` | 8080 | Web portal port |
-| `DOMAIN` | — | Custom local domain (e.g. diwan.local) |
+| `DOMAIN` |  -  | Custom local domain (e.g. diwan.local) |
 | `MEDIA_ROOTS` | All drives | Comma-separated folder paths |
 | `DATA_DIR` | AppData | Database and config location |
 

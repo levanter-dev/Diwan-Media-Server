@@ -189,7 +189,7 @@ def _version_label(meta: dict) -> str:
             parts.append("480p")
         else:
             parts.append(f"{h}p")
-    return " · ".join(parts) if parts else "Unknown"
+    return " - ".join(parts) if parts else "Unknown"
 
 
 def _version_sort_key(entry: dict) -> tuple:
@@ -231,7 +231,7 @@ def _sync_versions(conn, folder: Path, media_id: int, library_id: int,
             "label": _version_label(meta),
         })
 
-    # Sort best → worst and pick the default
+    # Sort best -> worst and pick the default
     probed.sort(key=_version_sort_key)
     default = probed[0]
     serialized_meta = json.dumps(merged_meta, ensure_ascii=False) if merged_meta else None
