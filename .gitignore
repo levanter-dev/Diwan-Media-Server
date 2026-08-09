@@ -53,3 +53,4 @@ app/scrapers/shahid.py
 app/scrapers/shuttletv.py
 app/scrapers/soap2day.py
 
+.tmp

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import queue
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -495,12 +496,32 @@ def media_filter_model(media_id: int, settings: dict[str, Any] | None = None) ->
         conn.close()
 
 
+def _media_completed_model_keys(conn: sqlite3.Connection, media_id: int) -> set[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT model_version FROM content_segments WHERE media_id=?",
+        (media_id,),
+    ).fetchall()
+    keys = {_segment_model_key(dict(row)) for row in rows}
+    job = conn.execute(
+        "SELECT model_version FROM content_analysis_jobs WHERE media_id=? AND status='completed'",
+        (media_id,),
+    ).fetchone()
+    if job:
+        _run_key, run_models = _run_models_from_version(job["model_version"])
+        keys.update(run_models)
+    return keys
+
+
 def save_media_filter_model(media_id: int, model_key: str | None) -> dict[str, Any]:
     normalized = _normalized_model_key(model_key)
     conn = connect()
     try:
         if not conn.execute("SELECT 1 FROM media_items WHERE id=?", (media_id,)).fetchone():
             raise AnalysisError("Media not found")
+        if model_key:
+            completed_models = _media_completed_model_keys(conn, media_id)
+            if normalized not in completed_models:
+                raise AnalysisError("Run this model on the media before setting it active")
         if not model_key or normalized == get_filter_settings()["model_key"]:
             conn.execute("DELETE FROM media_filter_model_overrides WHERE media_id=?", (media_id,))
         else:
@@ -665,6 +686,9 @@ def analysis_payload(media_id: int) -> dict[str, Any]:
         bucket = model_comparison.setdefault(key, {"model_key": key, "segments": [], "count": 0})
         bucket["segments"].append(segment)
         bucket["count"] += 1
+    completed_model_keys = set(model_comparison)
+    if job_dict and job_dict.get("status") == "completed" and settings_match:
+        completed_model_keys.update(completed_run_models)
     active_model_segments = [segment for segment in segments if _segment_model_key(segment) == model_key]
     merge_settings = settings
     if active_model_segments:
@@ -679,6 +703,7 @@ def analysis_payload(media_id: int) -> dict[str, Any]:
             "settings": settings, "runtime": runtime_status(), "ready": ready,
             "stale": stale, "filter_state": filter_state,
             "model_key": model_key, "global_model_key": settings["model_key"],
+            "completed_model_keys": sorted(completed_model_keys),
             "media_model_overridden": model_key != settings["model_key"],
             "media_filter_enabled": media_filter_enabled}
 
@@ -1124,7 +1149,10 @@ def _run_job(job_id: int) -> None:
     analysis_version = _analysis_model_version(run_model_key)
     thresholds = SENSITIVITY_THRESHOLDS[settings["sensitivity"]]
     anatomy_categories = [category for category in categories if CATEGORY_INFO[category]["detector"] == "anatomy"]
-    context_categories = [category for category in categories if category in CONTEXT_PROMPTS]
+    context_categories = [
+        category for category in categories
+        if category in CONTEXT_PROMPTS and CATEGORY_INFO[category]["detector"] == "context"
+    ]
     nsfw_categories = [category for category in categories if category in {"sexual_activity", "revealing_attire", "nudity"}]
     initial_progress = min(0.99, checkpoint / duration) if duration else 0.0
     initial_message = (
